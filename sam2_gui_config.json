@@ -1,0 +1,8 @@
+{
+  "data_dir": "/Users/seanfoley/Desktop/prompt/data",
+  "video_subdir": "video/video",
+  "frames_temp_dir": "/tmp/sam2_frames",
+  "checkpoint": "checkpoints/sam2.1_hiera_large.pt",
+  "model_cfg": "configs/sam2.1/sam2.1_hiera_l.yaml",
+  "device": "cuda"
+}

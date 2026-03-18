@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.\\(py|ipynb\\)$\")",
+      "Bash(/Users/seanfoley/miniconda3/envs/myenv/bin/python -c \"import hydra; print\\(hydra.__version__\\)\" 2>&1)"
+    ]
+  }
+}
