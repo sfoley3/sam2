@@ -1,5 +1,5 @@
 {
-  "data_dir": "/Users/seanfoley/Desktop/prompt/data",
+  "data_dir": "/data1/span_data/prompt/data/mri",
   "video_subdir": "video/video",
   "frames_temp_dir": "/tmp/sam2_frames",
   "checkpoint": "checkpoints/sam2.1_hiera_large.pt",

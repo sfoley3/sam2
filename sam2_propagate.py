@@ -3,11 +3,11 @@
 sam2_propagate.py — Batch propagation of SAM2 prompts across all videos for a speaker.
 
 Usage:
+    # single GPU
     python sam2_propagate.py --session path/to/session.json [--device cuda:0] [--chunk 150]
 
-For multi-GPU runs, launch one process per GPU:
-    python sam2_propagate.py --session session.json --device cuda:0 &
-    python sam2_propagate.py --session session.json --device cuda:1 &
+    # multi-GPU (distribute videos across GPUs 0,1,2,3)
+    python sam2_propagate.py --session path/to/session.json --gpus 0,1,2,3
 
 Outputs per video:
     data_dir/spk/sam2/masks/{video_basename}/{region_name}.npy   (bool T×H×W)
@@ -16,7 +16,9 @@ Outputs per video:
 
 import argparse
 import json
+import multiprocessing
 import os
+import queue
 import subprocess
 import sys
 
@@ -72,13 +74,23 @@ def get_overlay_path(spk: str, video_basename: str) -> str:
 # ── Frame extraction ───────────────────────────────────────────────────────────
 
 def extract_frames(video_path: str, frames_dir: str) -> None:
-    """Extract all frames to frames_dir as %05d.jpg (ffmpeg, q:v 2)."""
+    """Extract all frames to frames_dir as %05d.jpg using cv2 (matches notebook)."""
     os.makedirs(frames_dir, exist_ok=True)
-    subprocess.run(
-        ['ffmpeg', '-y', '-i', video_path,
-         '-q:v', '2', '-start_number', '0',
-         os.path.join(frames_dir, '%05d.jpg')],
-        check=True, capture_output=True)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f'Cannot open {video_path}')
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        cv2.imwrite(
+            os.path.join(frames_dir, f'{idx:05d}.jpg'),
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 95],
+        )
+        idx += 1
+    cap.release()
 
 
 # ── Overlay rendering ──────────────────────────────────────────────────────────
@@ -94,7 +106,7 @@ def write_overlay_video(
     masks_per_region: dict,   # region_name → (T, H, W) bool array
     colors:       dict,       # region_name → hex color string
     output_path:  str,
-    alpha:        float = 0.45,
+    alpha:        float = 0.7,
 ) -> None:
     """Write an MP4 with coloured mask overlays burned in."""
     cap = cv2.VideoCapture(video_path)
@@ -125,12 +137,22 @@ def write_overlay_video(
                 (1 - alpha) * frame[mask].astype(np.float32) +
                 alpha * np.array(bgr, dtype=np.float32)
             ).astype(np.uint8)
-        cv2.addWeighted(overlay, 1.0, frame, 0.0, 0, overlay)
         writer.write(overlay)
         frame_idx += 1
 
     cap.release()
     writer.release()
+
+    # Re-encode to libx264/yuv420p so timing metadata is correct for playback
+    raw_path = output_path + '.raw.mp4'
+    os.rename(output_path, raw_path)
+    subprocess.run(
+        ['ffmpeg', '-y', '-i', raw_path,
+         '-vcodec', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23',
+         output_path],
+        check=True, capture_output=True,
+    )
+    os.remove(raw_path)
 
 
 # ── Propagation core ───────────────────────────────────────────────────────────
@@ -177,8 +199,8 @@ def propagate_video(
             inference_state,
             frame_idx=init_frame_idx,
             obj_id=region['obj_id'],
-            points=region['points'],
-            labels=region['labels'],
+            points=np.array(region['points'], dtype=np.float32),
+            labels=np.array(region['labels'], dtype=np.int32),
             clear_old_points=True,
         )
 
@@ -261,16 +283,53 @@ def propagate_video(
     print(f'  Done: {video_basename}')
 
 
+# ── Multi-GPU worker ───────────────────────────────────────────────────────────
+
+def _gpu_worker(gpu_id: int, session: dict, chunk: int,
+                work_q: multiprocessing.Queue,
+                done_q: multiprocessing.Queue) -> None:
+    """Load one model instance on gpu_id, drain work_q, report results to done_q."""
+    device = f'cuda:{gpu_id}'
+    spk    = session['speaker']
+
+    from sam2.build_sam import build_sam2_video_predictor
+    ckpt = os.path.join(_HERE, CHECKPOINT)
+    print(f'[GPU {gpu_id}] Loading SAM2 model on {device}…', flush=True)
+    predictor = build_sam2_video_predictor(MODEL_CFG, ckpt_path=ckpt, device=device)
+    print(f'[GPU {gpu_id}] Model ready.', flush=True)
+
+    while True:
+        try:
+            vid_name = work_q.get(timeout=5)
+        except queue.Empty:
+            break
+
+        video_path = os.path.join(get_video_dir(spk), vid_name)
+        print(f'\n[GPU {gpu_id}] → {vid_name}', flush=True)
+        try:
+            propagate_video(predictor, session, video_path, spk,
+                            chunk=chunk, device=device)
+            done_q.put((gpu_id, vid_name, None))
+        except Exception as e:
+            done_q.put((gpu_id, vid_name, str(e)))
+
+    print(f'[GPU {gpu_id}] Done.', flush=True)
+
+
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description='Batch-propagate SAM2 prompts across all videos for a speaker.')
     parser.add_argument('--session', required=True,
-                        help='Path to the session JSON saved by sam2_gui.py')
+                        help='Path to the session JSON saved by the notebook')
     parser.add_argument('--device',  default=None,
-                        help='PyTorch device (e.g. cuda, cuda:0, cpu). '
-                             'Overrides config.')
+                        help='PyTorch device for single-GPU mode (e.g. cuda:0, cpu). '
+                             'Ignored when --gpus is set.')
+    parser.add_argument('--gpus',    default=None,
+                        help='Comma-separated GPU indices for multi-GPU mode '
+                             '(e.g. 0,1,2,3). Each GPU runs its own model instance '
+                             'and pulls videos from a shared queue.')
     parser.add_argument('--chunk',   type=int, default=150,
                         help='Frames per propagation chunk (default: 150)')
     args = parser.parse_args()
@@ -279,18 +338,7 @@ def main():
     with open(args.session) as f:
         session = json.load(f)
 
-    spk     = session['speaker']
-    device  = args.device or _cfg.get('device', 'cuda')
-
-    # ── build predictor ───────────────────────────────────────────────────────
-    from sam2.build_sam import build_sam2_video_predictor
-    ckpt = os.path.join(_HERE, CHECKPOINT)
-    print(f'Loading SAM2 model on {device}…')
-    predictor = build_sam2_video_predictor(MODEL_CFG, ckpt_path=ckpt,
-                                           device=device)
-    print('Model loaded.')
-
-    # ── enumerate videos ──────────────────────────────────────────────────────
+    spk         = session['speaker']
     video_files = get_video_files(spk)
     if not video_files:
         print(f'No .avi files found for speaker {spk} in {get_video_dir(spk)}')
@@ -298,18 +346,63 @@ def main():
 
     print(f'Speaker: {spk}  ({len(video_files)} videos)')
 
-    for vid_name in video_files:
-        video_path = os.path.join(get_video_dir(spk), vid_name)
-        print(f'\n[{vid_name}]')
-        try:
-            propagate_video(predictor, session, video_path, spk,
-                            chunk=args.chunk, device=device)
-        except Exception as e:
-            print(f'  ERROR: {e}')
-            continue
+    # ── multi-GPU path ────────────────────────────────────────────────────────
+    if args.gpus:
+        gpu_ids = [int(g.strip()) for g in args.gpus.split(',')]
+        print(f'Multi-GPU mode: {gpu_ids}')
+
+        work_q = multiprocessing.Queue()
+        done_q = multiprocessing.Queue()
+
+        for vid_name in video_files:
+            work_q.put(vid_name)
+
+        workers = []
+        for gpu_id in gpu_ids:
+            p = multiprocessing.Process(
+                target=_gpu_worker,
+                args=(gpu_id, session, args.chunk, work_q, done_q),
+                daemon=True,
+            )
+            p.start()
+            workers.append(p)
+
+        for _ in video_files:
+            gpu_id, vid_name, err = done_q.get()
+            if err:
+                print(f'  [GPU {gpu_id}] ERROR on {vid_name}: {err}')
+            else:
+                print(f'  [GPU {gpu_id}] Finished {vid_name}')
+
+        for p in workers:
+            p.join()
+
+    # ── single-GPU path ───────────────────────────────────────────────────────
+    else:
+        device = args.device or _cfg.get('device', 'cuda')
+
+        from sam2.build_sam import build_sam2_video_predictor
+        ckpt = os.path.join(_HERE, CHECKPOINT)
+        print(f'Loading SAM2 model on {device}…')
+        predictor = build_sam2_video_predictor(MODEL_CFG, ckpt_path=ckpt,
+                                               device=device)
+        print('Model loaded.')
+
+        for vid_name in video_files:
+            if 'picture_description1' not in vid_name:
+                continue
+            video_path = os.path.join(get_video_dir(spk), vid_name)
+            print(f'\n[{vid_name}]')
+            try:
+                propagate_video(predictor, session, video_path, spk,
+                                chunk=args.chunk, device=device)
+            except Exception as e:
+                print(f'  ERROR: {e}')
+                continue
 
     print('\nAll done.')
 
 
 if __name__ == '__main__':
+    multiprocessing.set_start_method('spawn', force=True)
     main()
