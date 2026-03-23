@@ -4,7 +4,7 @@ sam2_propagate.py — Batch propagation of SAM2 prompts across all videos for a 
 
 Usage:
     # single GPU
-    python sam2_propagate.py --spk spk15 [--device cuda:0] [--chunk 150]
+    python sam2_propagate.py --spk spk15 [--chunk 150] [--subset 200]
 
     # multi-GPU (distribute videos across GPUs 0,1,2,3)
     python sam2_propagate.py --spk spk15 --gpus 0,1,2,3
@@ -13,8 +13,8 @@ Session JSON is read automatically from {data_dir}/{spk}/sam_seg/session.json
 as configured in sam2_gui_config.json.
 
 Outputs per video:
-    data_dir/spk/sam2/masks/{video_basename}/{region_name}.npy   (bool T×H×W)
-    data_dir/spk/sam2/overlays/{video_basename}.mp4
+    data_dir/spk/sam_seg/masks/{video_basename}/{region_name}.npy   (bool T×H×W)
+    data_dir/spk/sam_seg/overlays/{video_basename}.mp4
 """
 
 import argparse
@@ -71,11 +71,11 @@ def get_frames_dir(spk: str, video_basename: str) -> str:
 
 
 def get_mask_dir(spk: str, video_basename: str) -> str:
-    return os.path.join(DATA_DIR, spk, "sam2", "masks", video_basename)
+    return os.path.join(DATA_DIR, spk, "sam_seg", "masks", video_basename)
 
 
 def get_overlay_path(spk: str, video_basename: str) -> str:
-    return os.path.join(DATA_DIR, spk, "sam2", "overlays", f"{video_basename}.mp4")
+    return os.path.join(DATA_DIR, spk, "sam_seg", "overlays", f"{video_basename}.mp4")
 
 
 # ── Frame extraction ───────────────────────────────────────────────────────────
@@ -119,6 +119,23 @@ def extract_frames(
 # ── Overlay rendering ──────────────────────────────────────────────────────────
 
 
+def _get_fps(video_path: str) -> float:
+    """Get FPS via ffprobe — more reliable than cv2 for AVI files."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             video_path],
+            capture_output=True, text=True, check=True,
+        )
+        num, den = result.stdout.strip().split("/")
+        return float(num) / float(den)
+    except Exception:
+        fps = cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FPS)
+        return fps or 25.0
+
+
 def _hex_to_bgr(hex_color: str) -> tuple:
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
@@ -136,15 +153,41 @@ def write_overlay_video(
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open {video_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps = _get_fps(video_path)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames_in = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    print(f"  [FPS] ffprobe → {fps:.3f} fps | source: {total_frames_in} frames "
+          f"= {total_frames_in / fps:.1f}s")
+
+    n_mask_frames = (
+        max(m.shape[0] for m in masks_per_region.values())
+        if masks_per_region else total_frames_in
+    )
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    # Pipe raw BGR frames directly to ffmpeg — avoids cv2.VideoWriter container
+    # metadata issues that cause incorrect fps at high frame rates (e.g. 99 fps).
+    ffmpeg_proc = subprocess.Popen(
+        [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{w}x{h}",
+            "-r", str(fps),
+            "-i", "pipe:0",
+            "-vcodec", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "23",
+            output_path,
+        ],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
     frame_idx = 0
-    while True:
+    while frame_idx < n_mask_frames:
         ret, frame = cap.read()
         if not ret:
             break
@@ -158,33 +201,30 @@ def write_overlay_video(
                 (1 - alpha) * frame[mask].astype(np.float32)
                 + alpha * np.array(bgr, dtype=np.float32)
             ).astype(np.uint8)
-        writer.write(overlay)
+        ffmpeg_proc.stdin.write(overlay.tobytes())
         frame_idx += 1
 
     cap.release()
-    writer.release()
+    ffmpeg_proc.stdin.close()
+    stderr_bytes = ffmpeg_proc.stderr.read()
+    ffmpeg_proc.wait()
+    if ffmpeg_proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed:\n{stderr_bytes.decode()}"
+        )
+    print(f"  [FPS] wrote {frame_idx} frames → {frame_idx / fps:.1f}s at {fps:.3f} fps (intended)")
 
-    # Re-encode to libx264/yuv420p so timing metadata is correct for playback
-    raw_path = output_path + ".raw.mp4"
-    os.rename(output_path, raw_path)
-    subprocess.run(
+    # Probe the output file to confirm actual stored fps and duration
+    _probe = subprocess.run(
         [
-            "ffmpeg",
-            "-y",
-            "-i",
-            raw_path,
-            "-vcodec",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-crf",
-            "23",
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate,nb_frames,duration",
+            "-of", "default=noprint_wrappers=1",
             output_path,
         ],
-        check=True,
-        capture_output=True,
+        capture_output=True, text=True,
     )
-    os.remove(raw_path)
+    print(f"  [FPS] output file probe:\n    " + _probe.stdout.strip().replace("\n", "\n    "))
 
 
 # ── Propagation core ───────────────────────────────────────────────────────────
@@ -196,10 +236,18 @@ def propagate_video(
     video_path: str,
     spk: str,
     chunk: int,
+    subset: int = None,
 ) -> None:
     """Propagate saved prompts through one video and save masks + overlay."""
     regions = session["regions"]
     init_frame_path = session.get("init_frame_path")
+    if not init_frame_path:
+        # Fallback for sessions saved before init_frame_path was added
+        init_frame_path = os.path.join(DATA_DIR, spk, "sam_seg", f"{spk}_frame.jpg")
+        if os.path.exists(init_frame_path):
+            print(f"  Using derived init frame path: {init_frame_path}")
+        else:
+            init_frame_path = None
     video_basename = os.path.splitext(os.path.basename(video_path))[0]
 
     # ── extract frames, prepending the saved init frame as frame 0 ──────────
@@ -217,6 +265,16 @@ def propagate_video(
     if n_video_frames <= 0:
         print(f"  WARNING: no frames extracted for {video_basename}; skipping.")
         return
+
+    if subset is not None:
+        n_video_frames = min(n_video_frames, subset)
+        n_total_frames = n_video_frames + frame_offset
+        print(f"  [SUBSET] Limiting to first {n_video_frames} video frames")
+
+    _src_fps = _get_fps(video_path)
+    print(f"  Source FPS (ffprobe): {_src_fps:.3f} | "
+          f"video frames: {n_video_frames} | "
+          f"duration: {n_video_frames / _src_fps:.1f}s")
 
     # ── init SAM2 inference state ────────────────────────────────────────────
     print(f"  Initialising SAM2 state ({n_total_frames} frames, anchor at frame 0)…")
@@ -270,12 +328,22 @@ def propagate_video(
     vid_h = int(cap_tmp.get(cv2.CAP_PROP_FRAME_HEIGHT))
     vid_w = int(cap_tmp.get(cv2.CAP_PROP_FRAME_WIDTH))
     cap_tmp.release()
-    empty = np.zeros((vid_h, vid_w), dtype=bool)
 
     for oid in collected:
         for i in range(n_video_frames):
             if collected[oid][i] is None:
-                collected[oid][i] = empty
+                collected[oid][i] = np.zeros((vid_h, vid_w), dtype=bool)
+
+    # ── mask coverage diagnostics ─────────────────────────────────────────────
+    for oid, frames_list in collected.items():
+        name = obj_id_to_name.get(oid, f"obj_{oid}")
+        filled = [m for m in frames_list if m.any()]
+        if filled:
+            coverage = np.mean([m.mean() for m in filled])
+            print(f"  {name}: {len(filled)}/{n_video_frames} frames with mask, "
+                  f"mean coverage {coverage:.3%}")
+        else:
+            print(f"  {name}: no mask found in any frame")
 
     # ── save .npy masks ──────────────────────────────────────────────────────
     mask_dir = get_mask_dir(spk, video_basename)
@@ -308,6 +376,7 @@ def _gpu_worker(
     chunk: int,
     work_q: multiprocessing.Queue,
     done_q: multiprocessing.Queue,
+    subset: int = None,
 ) -> None:
     """Load one model instance on gpu_id, drain work_q, report results to done_q."""
     device = f"cuda:{gpu_id}"
@@ -327,7 +396,7 @@ def _gpu_worker(
         video_path = os.path.join(get_video_dir(spk), vid_name)
         print(f"\n[GPU {gpu_id}] → {vid_name}", flush=True)
         try:
-            propagate_video(predictor, session, video_path, spk, chunk=chunk)
+            propagate_video(predictor, session, video_path, spk, chunk=chunk, subset=subset)
             done_q.put((gpu_id, vid_name, None))
         except Exception as e:
             done_q.put((gpu_id, vid_name, str(e)))
@@ -360,6 +429,13 @@ def main():
         type=int,
         default=150,
         help="Frames per propagation chunk (default: 150)",
+    )
+    parser.add_argument(
+        "--subset",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Only propagate the first N frames of each video (diagnostic mode).",
     )
     args = parser.parse_args()
 
@@ -395,7 +471,7 @@ def main():
         for gpu_id in gpu_ids:
             p = multiprocessing.Process(
                 target=_gpu_worker,
-                args=(gpu_id, session, args.chunk, work_q, done_q),
+                args=(gpu_id, session, args.chunk, work_q, done_q, args.subset),
                 daemon=True,
             )
             p.start()
@@ -426,7 +502,7 @@ def main():
             video_path = os.path.join(get_video_dir(spk), vid_name)
             print(f"\n[{vid_name}]")
             try:
-                propagate_video(predictor, session, video_path, spk, chunk=args.chunk)
+                propagate_video(predictor, session, video_path, spk, chunk=args.chunk, subset=args.subset)
             except Exception as e:
                 print(f"  ERROR: {e}")
                 continue
