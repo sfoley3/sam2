@@ -13,11 +13,12 @@ Session JSON is read automatically from {data_dir}/{spk}/sam_seg/session.json
 as configured in sam2_gui_config.json.
 
 Outputs per video:
-    data_dir/spk/sam_seg/masks/{video_basename}/{region_name}.npy   (bool T×H×W)
+    data_dir/spk/sam_seg/masks/{spk}_{video_basename}.npz   (keys=region names, each bool T×H×W)
     data_dir/spk/sam_seg/overlays/{video_basename}.mp4
 """
 
 import argparse
+import gc
 import json
 import multiprocessing
 import os
@@ -29,12 +30,16 @@ import sys
 import cv2
 import numpy as np
 import torch
+from tqdm import tqdm
+
+# Suppress SAM2's internal tqdm bars (forward + reverse pass)
+os.environ["TQDM_DISABLE"] = "1"
 from sam2.build_sam import build_sam2_video_predictor
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_PATH = os.path.join(_HERE, "sam2_gui_config.json")
+_CONFIG_PATH = os.path.join(_HERE, "sam2_config.json")
 
 
 def _load_config() -> dict:
@@ -46,7 +51,7 @@ def _load_config() -> dict:
 
 _cfg = _load_config()
 
-DATA_DIR = _cfg.get("data_dir", "/data")
+DATA_DIR = _cfg.get("data_dir")
 VIDEO_SUBDIR = _cfg.get("video_subdir", "video/video")
 FRAMES_TEMP = _cfg.get("frames_temp_dir", "/tmp/sam2_frames")
 CHECKPOINT = _cfg.get("checkpoint", "checkpoints/sam2.1_hiera_large.pt")
@@ -70,8 +75,8 @@ def get_frames_dir(spk: str, video_basename: str) -> str:
     return os.path.join(FRAMES_TEMP, spk, video_basename)
 
 
-def get_mask_dir(spk: str, video_basename: str) -> str:
-    return os.path.join(DATA_DIR, spk, "sam_seg", "masks", video_basename)
+def get_mask_path(spk: str, video_basename: str) -> str:
+    return os.path.join(DATA_DIR, spk, "sam_seg", "masks", f"{spk}_{video_basename}.npz")
 
 
 def get_overlay_path(spk: str, video_basename: str) -> str:
@@ -82,7 +87,8 @@ def get_overlay_path(spk: str, video_basename: str) -> str:
 
 
 def extract_frames(
-    video_path: str, frames_dir: str, init_frame_path: str = None
+    video_path: str, frames_dir: str, init_frame_path: str = None,
+    standard_size: int = None,
 ) -> int:
     """Extract all frames to frames_dir as %05d.jpg using cv2 (matches notebook).
 
@@ -90,12 +96,21 @@ def extract_frames(
     frames from 00001.jpg onward so SAM2 always anchors on the same reference
     frame regardless of which video is being processed.
 
+    If standard_size is given, all frames (including the init frame) are
+    resized to standard_size × standard_size so that prompt points in the
+    standardised coordinate space are directly usable.
+
     Returns the frame offset (1 if init frame was prepended, else 0).
     """
     os.makedirs(frames_dir, exist_ok=True)
     offset = 0
     if init_frame_path and os.path.exists(init_frame_path):
-        shutil.copy2(init_frame_path, os.path.join(frames_dir, "00000.jpg"))
+        init_img = cv2.imread(init_frame_path)
+        if standard_size:
+            init_img = cv2.resize(init_img, (standard_size, standard_size),
+                                  interpolation=cv2.INTER_LANCZOS4)
+        cv2.imwrite(os.path.join(frames_dir, "00000.jpg"), init_img,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95])
         offset = 1
 
     cap = cv2.VideoCapture(video_path)
@@ -106,6 +121,9 @@ def extract_frames(
         ret, frame = cap.read()
         if not ret:
             break
+        if standard_size:
+            frame = cv2.resize(frame, (standard_size, standard_size),
+                               interpolation=cv2.INTER_LANCZOS4)
         cv2.imwrite(
             os.path.join(frames_dir, f"{idx:05d}.jpg"),
             frame,
@@ -196,6 +214,9 @@ def write_overlay_video(
             if frame_idx >= masks.shape[0]:
                 continue
             mask = masks[frame_idx]  # (H, W) bool
+            if mask.shape != (h, w):
+                mask = cv2.resize(mask.astype(np.uint8), (w, h),
+                                  interpolation=cv2.INTER_NEAREST).astype(bool)
             bgr = _hex_to_bgr(colors[name])
             overlay[mask] = (
                 (1 - alpha) * frame[mask].astype(np.float32)
@@ -240,6 +261,7 @@ def propagate_video(
 ) -> None:
     """Propagate saved prompts through one video and save masks + overlay."""
     regions = session["regions"]
+    standard_size = session.get("standard_size")
     init_frame_path = session.get("init_frame_path")
     if not init_frame_path:
         # Fallback for sessions saved before init_frame_path was added
@@ -253,9 +275,12 @@ def propagate_video(
     # ── extract frames, prepending the saved init frame as frame 0 ──────────
     frames_dir = get_frames_dir(spk, video_basename)
     print(f"  Extracting frames → {frames_dir}")
-    frame_offset = extract_frames(video_path, frames_dir, init_frame_path)
+    frame_offset = extract_frames(video_path, frames_dir, init_frame_path,
+                                  standard_size=standard_size)
     if frame_offset:
         print("  Prepended init frame as 00000.jpg (anchor)")
+    if standard_size:
+        print(f"  All frames resized to {standard_size}×{standard_size}")
 
     frame_files = sorted(
         f for f in os.listdir(frames_dir) if f.lower().endswith(".jpg")
@@ -281,7 +306,7 @@ def propagate_video(
     inference_state = predictor.init_state(
         video_path=frames_dir,
         offload_video_to_cpu=True,
-        offload_state_to_cpu=False,
+        offload_state_to_cpu=True,
     )
     predictor.reset_state(inference_state)
 
@@ -306,6 +331,7 @@ def propagate_video(
     collected: dict = {r["obj_id"]: [None] * n_video_frames for r in regions}
 
     print(f"  Propagating (chunk={chunk})…")
+    pbar = tqdm(total=n_video_frames, desc=f"  {video_basename}", disable=False)
     start = 0
     while start < n_total_frames:
         end = min(start + chunk, n_total_frames)
@@ -318,10 +344,12 @@ def propagate_video(
             video_fid = frame_idx - frame_offset
             if video_fid < 0:
                 continue  # skip the synthetic anchor frame
+            pbar.update(1)
             for oid, m in zip(obj_ids, masks_np):
                 if oid in collected and video_fid < n_video_frames:
                     collected[oid][video_fid] = m
         start = end
+    pbar.close()
 
     # ── fill any None frames with empty masks ────────────────────────────────
     cap_tmp = cv2.VideoCapture(video_path)
@@ -329,10 +357,13 @@ def propagate_video(
     vid_w = int(cap_tmp.get(cv2.CAP_PROP_FRAME_WIDTH))
     cap_tmp.release()
 
+    mask_h = standard_size if standard_size else vid_h
+    mask_w = standard_size if standard_size else vid_w
+
     for oid in collected:
         for i in range(n_video_frames):
             if collected[oid][i] is None:
-                collected[oid][i] = np.zeros((vid_h, vid_w), dtype=bool)
+                collected[oid][i] = np.zeros((mask_h, mask_w), dtype=bool)
 
     # ── mask coverage diagnostics ─────────────────────────────────────────────
     for oid, frames_list in collected.items():
@@ -345,25 +376,34 @@ def propagate_video(
         else:
             print(f"  {name}: no mask found in any frame")
 
-    # ── save .npy masks ──────────────────────────────────────────────────────
-    mask_dir = get_mask_dir(spk, video_basename)
-    os.makedirs(mask_dir, exist_ok=True)
+    # ── save masks as single .npz ─────────────────────────────────────────────
+    mask_path = get_mask_path(spk, video_basename)
+    os.makedirs(os.path.dirname(mask_path), exist_ok=True)
 
     masks_per_region = {}
     colors_per_region = {}
     for oid, frames_list in collected.items():
         name = obj_id_to_name.get(oid, f"obj_{oid}")
         stack = np.stack(frames_list, axis=0)  # (T, H, W)
-        npy_path = os.path.join(mask_dir, f"{name}.npy")
-        np.save(npy_path, stack)
-        print(f"  Saved mask {stack.shape} → {npy_path}")
         masks_per_region[name] = stack
         colors_per_region[name] = obj_id_to_color.get(oid, "#ffffff")
+
+    np.savez(mask_path, **masks_per_region)
+    print(f"  Saved masks {list(masks_per_region.keys())} → {mask_path}")
 
     # ── write overlay video ──────────────────────────────────────────────────
     overlay_path = get_overlay_path(spk, video_basename)
     print(f"  Writing overlay video → {overlay_path}")
     write_overlay_video(video_path, masks_per_region, colors_per_region, overlay_path)
+
+    # ── cleanup GPU memory & temp frames ─────────────────────────────────────
+    predictor.reset_state(inference_state)
+    del inference_state, collected, masks_per_region
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if os.path.isdir(frames_dir):
+        shutil.rmtree(frames_dir)
     print(f"  Done: {video_basename}")
 
 
@@ -396,9 +436,11 @@ def _gpu_worker(
         video_path = os.path.join(get_video_dir(spk), vid_name)
         print(f"\n[GPU {gpu_id}] → {vid_name}", flush=True)
         try:
-            propagate_video(predictor, session, video_path, spk, chunk=chunk, subset=subset)
+            with torch.inference_mode():
+                propagate_video(predictor, session, video_path, spk, chunk=chunk, subset=subset)
             done_q.put((gpu_id, vid_name, None))
         except Exception as e:
+            torch.cuda.empty_cache()
             done_q.put((gpu_id, vid_name, str(e)))
 
     print(f"[GPU {gpu_id}] Done.", flush=True)
@@ -431,6 +473,12 @@ def main():
         help="Frames per propagation chunk (default: 150)",
     )
     parser.add_argument(
+        "--session",
+        type=int,
+        default=1,
+        help="Which SAM2 session to load (default: 1, corresponding to session1.json). ",
+    )
+    parser.add_argument(
         "--subset",
         type=int,
         default=None,
@@ -441,7 +489,8 @@ def main():
 
     # ── load session ─────────────────────────────────────────────────────────
     spk = args.spk
-    session_path = os.path.join(DATA_DIR, spk, "sam_seg", "session.json")
+    session_path = os.path.join(DATA_DIR, spk, "sam_seg", "sessions", f"session{args.session}.json")
+    print(f"Looking for session JSON at {session_path}…")
     if not os.path.exists(session_path):
         print(f"No session found for {spk} at {session_path}")
         sys.exit(1)
@@ -497,14 +546,15 @@ def main():
         print("Model loaded.")
 
         for vid_name in video_files:
-            if "picture_description1" not in vid_name:
-                continue
             video_path = os.path.join(get_video_dir(spk), vid_name)
             print(f"\n[{vid_name}]")
             try:
-                propagate_video(predictor, session, video_path, spk, chunk=args.chunk, subset=args.subset)
+                with torch.inference_mode():
+                    propagate_video(predictor, session, video_path, spk, chunk=args.chunk, subset=args.subset)
             except Exception as e:
                 print(f"  ERROR: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue
 
     print("\nAll done.")
