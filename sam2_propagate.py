@@ -36,51 +36,39 @@ from tqdm import tqdm
 os.environ["TQDM_DISABLE"] = "1"
 from sam2.build_sam import build_sam2_video_predictor
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_PATH = os.path.join(_HERE, "sam2_config.json")
-
-
-def _load_config() -> dict:
-    if os.path.exists(_CONFIG_PATH):
-        with open(_CONFIG_PATH) as f:
-            return json.load(f)
-    return {}
-
-
-_cfg = _load_config()
-
-DATA_DIR = _cfg.get("data_dir")
-VIDEO_SUBDIR = _cfg.get("video_subdir", "video/video")
-FRAMES_TEMP = _cfg.get("frames_temp_dir", "/tmp/sam2_frames")
-CHECKPOINT = _cfg.get("checkpoint", "checkpoints/sam2.1_hiera_large.pt")
-MODEL_CFG = _cfg.get("model_cfg", "configs/sam2.1/sam2.1_hiera_l.yaml")
 
 # ── Path helpers ───────────────────────────────────────────────────────────────
 
 
-def get_video_dir(spk: str) -> str:
-    return os.path.join(DATA_DIR, spk, *VIDEO_SUBDIR.split("/"))
+def _load_config(CONFIG_PATH) -> dict:
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
 
 
-def get_video_files(spk: str) -> list:
-    vd = get_video_dir(spk)
+def get_video_dir(data_dir: str, video_subdir: str, spk: str) -> str:
+    return os.path.join(data_dir, spk, *video_subdir.split("/"))
+
+
+def get_video_files(data_dir: str, video_subdir: str, spk: str) -> list:
+    vd = get_video_dir(data_dir, video_subdir, spk)
     if not os.path.isdir(vd):
         return []
     return sorted(f for f in os.listdir(vd) if f.lower().endswith(".avi"))
 
 
-def get_frames_dir(spk: str, video_basename: str) -> str:
-    return os.path.join(FRAMES_TEMP, spk, video_basename)
+def get_frames_dir(frames_temp: str, spk: str, video_basename: str) -> str:
+    return os.path.join(frames_temp, spk, video_basename)
 
 
-def get_mask_path(spk: str, video_basename: str) -> str:
-    return os.path.join(DATA_DIR, spk, "sam_seg", "masks", f"{spk}_{video_basename}.npz")
+def get_mask_path(data_dir: str, spk: str, video_basename: str) -> str:
+    return os.path.join(data_dir, spk, "sam_seg", "masks", f"{spk}_{video_basename}.npz")
 
 
-def get_overlay_path(spk: str, video_basename: str) -> str:
-    return os.path.join(DATA_DIR, spk, "sam_seg", "overlays", f"{video_basename}.mp4")
+def get_overlay_path(data_dir: str, spk: str, video_basename: str) -> str:
+    return os.path.join(data_dir, spk, "sam_seg", "overlays", f"{video_basename}.mp4")
 
 
 # ── Frame extraction ───────────────────────────────────────────────────────────
@@ -257,6 +245,8 @@ def propagate_video(
     video_path: str,
     spk: str,
     chunk: int,
+    data_dir: str,
+    frames_temp: str,
     subset: int = None,
 ) -> None:
     """Propagate saved prompts through one video and save masks + overlay."""
@@ -265,7 +255,7 @@ def propagate_video(
     init_frame_path = session.get("init_frame_path")
     if not init_frame_path:
         # Fallback for sessions saved before init_frame_path was added
-        init_frame_path = os.path.join(DATA_DIR, spk, "sam_seg", f"{spk}_frame.jpg")
+        init_frame_path = os.path.join(data_dir, spk, "sam_seg", f"{spk}_frame.jpg")
         if os.path.exists(init_frame_path):
             print(f"  Using derived init frame path: {init_frame_path}")
         else:
@@ -273,7 +263,7 @@ def propagate_video(
     video_basename = os.path.splitext(os.path.basename(video_path))[0]
 
     # ── extract frames, prepending the saved init frame as frame 0 ──────────
-    frames_dir = get_frames_dir(spk, video_basename)
+    frames_dir = get_frames_dir(frames_temp, spk, video_basename)
     print(f"  Extracting frames → {frames_dir}")
     frame_offset = extract_frames(video_path, frames_dir, init_frame_path,
                                   standard_size=standard_size)
@@ -377,7 +367,7 @@ def propagate_video(
             print(f"  {name}: no mask found in any frame")
 
     # ── save masks as single .npz ─────────────────────────────────────────────
-    mask_path = get_mask_path(spk, video_basename)
+    mask_path = get_mask_path(data_dir, spk, video_basename)
     os.makedirs(os.path.dirname(mask_path), exist_ok=True)
 
     masks_per_region = {}
@@ -392,7 +382,7 @@ def propagate_video(
     print(f"  Saved masks {list(masks_per_region.keys())} → {mask_path}")
 
     # ── write overlay video ──────────────────────────────────────────────────
-    overlay_path = get_overlay_path(spk, video_basename)
+    overlay_path = get_overlay_path(data_dir, spk, video_basename)
     print(f"  Writing overlay video → {overlay_path}")
     write_overlay_video(video_path, masks_per_region, colors_per_region, overlay_path)
 
@@ -416,15 +406,20 @@ def _gpu_worker(
     chunk: int,
     work_q: multiprocessing.Queue,
     done_q: multiprocessing.Queue,
+    data_dir: str,
+    video_subdir: str,
+    frames_temp: str,
+    checkpoint: str,
+    model_cfg: str,
     subset: int = None,
 ) -> None:
     """Load one model instance on gpu_id, drain work_q, report results to done_q."""
     device = f"cuda:{gpu_id}"
     spk = session["speaker"]
 
-    ckpt = os.path.join(_HERE, CHECKPOINT)
+    ckpt = os.path.join(_HERE, checkpoint)
     print(f"[GPU {gpu_id}] Loading SAM2 model on {device}…", flush=True)
-    predictor = build_sam2_video_predictor(MODEL_CFG, ckpt_path=ckpt, device=device)
+    predictor = build_sam2_video_predictor(model_cfg, ckpt_path=ckpt, device=device)
     print(f"[GPU {gpu_id}] Model ready.", flush=True)
 
     while True:
@@ -433,11 +428,12 @@ def _gpu_worker(
         except queue.Empty:
             break
 
-        video_path = os.path.join(get_video_dir(spk), vid_name)
+        video_path = os.path.join(get_video_dir(data_dir, video_subdir, spk), vid_name)
         print(f"\n[GPU {gpu_id}] → {vid_name}", flush=True)
         try:
             with torch.inference_mode():
-                propagate_video(predictor, session, video_path, spk, chunk=chunk, subset=subset)
+                propagate_video(predictor, session, video_path, spk, chunk=chunk,
+                                data_dir=data_dir, frames_temp=frames_temp, subset=subset)
             done_q.put((gpu_id, vid_name, None))
         except Exception as e:
             torch.cuda.empty_cache()
@@ -458,6 +454,11 @@ def main():
         required=True,
         help="Speaker ID (e.g. spk15). Session JSON is read from "
         "{data_dir}/{spk}/sam_seg/session.json as set in config.",
+    )
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help="which dataset to use, used to select config.",
     )
     parser.add_argument(
         "--gpus",
@@ -487,6 +488,16 @@ def main():
     )
     args = parser.parse_args()
 
+    CONFIG_PATH = os.path.join('./prompting_configs', f"sam2_{args.dataset}_config.json")
+
+    _cfg = _load_config(CONFIG_PATH)
+
+    DATA_DIR = _cfg.get("data_dir")
+    VIDEO_SUBDIR = _cfg.get("video_subdir")
+    FRAMES_TEMP = _cfg.get("frames_temp_dir", "/tmp/sam2_frames")
+    CHECKPOINT = _cfg.get("checkpoint", "checkpoints/sam2.1_hiera_large.pt")
+    MODEL_CFG = _cfg.get("model_cfg", "configs/sam2.1/sam2.1_hiera_l.yaml")
+
     # ── load session ─────────────────────────────────────────────────────────
     spk = args.spk
     session_path = os.path.join(DATA_DIR, spk, "sam_seg", "sessions", f"session{args.session}.json")
@@ -498,9 +509,9 @@ def main():
         session = json.load(f)
 
     spk = session["speaker"]
-    video_files = get_video_files(spk)
+    video_files = get_video_files(DATA_DIR, VIDEO_SUBDIR, spk)
     if not video_files:
-        print(f"No .avi files found for speaker {spk} in {get_video_dir(spk)}")
+        print(f"No .avi files found for speaker {spk} in {get_video_dir(DATA_DIR, VIDEO_SUBDIR, spk)}")
         sys.exit(1)
 
     print(f"Speaker: {spk}  ({len(video_files)} videos)")
@@ -520,7 +531,9 @@ def main():
         for gpu_id in gpu_ids:
             p = multiprocessing.Process(
                 target=_gpu_worker,
-                args=(gpu_id, session, args.chunk, work_q, done_q, args.subset),
+                args=(gpu_id, session, args.chunk, work_q, done_q,
+                      DATA_DIR, VIDEO_SUBDIR, FRAMES_TEMP, CHECKPOINT, MODEL_CFG,
+                      args.subset),
                 daemon=True,
             )
             p.start()
@@ -545,12 +558,15 @@ def main():
         predictor = build_sam2_video_predictor(MODEL_CFG, ckpt_path=ckpt, device=device)
         print("Model loaded.")
 
-        for vid_name in video_files:
-            video_path = os.path.join(get_video_dir(spk), vid_name)
+        for vid_name in tqdm(video_files):
+            if not "picture_description2" in vid_name:
+                continue
+            video_path = os.path.join(get_video_dir(DATA_DIR, VIDEO_SUBDIR, spk), vid_name)
             print(f"\n[{vid_name}]")
             try:
                 with torch.inference_mode():
-                    propagate_video(predictor, session, video_path, spk, chunk=args.chunk, subset=args.subset)
+                    propagate_video(predictor, session, video_path, spk, chunk=args.chunk,
+                                    data_dir=DATA_DIR, frames_temp=FRAMES_TEMP, subset=args.subset)
             except Exception as e:
                 print(f"  ERROR: {e}")
                 if torch.cuda.is_available():
