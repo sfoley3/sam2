@@ -1,0 +1,7 @@
+{
+  "data_dir": "/data1/span_data/velum_study",
+  "video_subdir": "video_split",
+  "frames_temp_dir": "/tmp/sam2_frames",
+  "checkpoint": "checkpoints/sam2.1_hiera_large.pt",
+  "model_cfg": "configs/sam2.1/sam2.1_hiera_l.yaml"
+}

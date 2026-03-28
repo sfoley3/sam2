@@ -559,8 +559,8 @@ def main():
         print("Model loaded.")
 
         for vid_name in tqdm(video_files):
-            if not "picture_description2" in vid_name:
-                continue
+            #if not "picture_description2" in vid_name:
+            #    continue
             video_path = os.path.join(get_video_dir(DATA_DIR, VIDEO_SUBDIR, spk), vid_name)
             print(f"\n[{vid_name}]")
             try:
