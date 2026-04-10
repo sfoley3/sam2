@@ -3,11 +3,14 @@
 sam2_propagate.py — Batch propagation of SAM2 prompts across all videos for a speaker.
 
 Usage:
-    # single GPU
-    python sam2_propagate.py --spk spk15 [--chunk 150] [--subset 200]
+    # single GPU (2 parallel workers by default)
+    python sam2_propagate.py --spk spk15 --dataset lss --gpus 2
 
-    # multi-GPU (distribute videos across GPUs 0,1,2,3)
-    python sam2_propagate.py --spk spk15 --gpus 0,1,2,3
+    # single GPU, 3 parallel workers
+    python sam2_propagate.py --spk spk15 --dataset lss --gpus 2 --jobs 3
+
+    # multi-GPU (one worker per GPU)
+    python sam2_propagate.py --spk spk15 --dataset lss --gpus 0,1,2,3
 
 Session JSON is read automatically from {data_dir}/{spk}/sam_seg/session.json
 as configured in sam2_gui_config.json.
@@ -34,7 +37,9 @@ from tqdm import tqdm
 
 # Suppress SAM2's internal tqdm bars (forward + reverse pass)
 os.environ["TQDM_DISABLE"] = "1"
-from sam2.build_sam import build_sam2_video_predictor
+
+# NOTE: sam2.build_sam is imported lazily (inside _gpu_worker / main) so that
+# spawn'd child processes don't initialise CUDA on all GPUs during module import.
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -402,6 +407,7 @@ def propagate_video(
 
 def _gpu_worker(
     gpu_id: int,
+    worker_id: int,
     session: dict,
     chunk: int,
     work_q: multiprocessing.Queue,
@@ -414,13 +420,20 @@ def _gpu_worker(
     subset: int = None,
 ) -> None:
     """Load one model instance on gpu_id, drain work_q, report results to done_q."""
-    device = f"cuda:{gpu_id}"
+    # Restrict this process to only the assigned GPU — must happen before
+    # any CUDA / SAM2 imports so the runtime only sees one device.
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    torch.cuda.set_device(0)
+    from sam2.build_sam import build_sam2_video_predictor
+
+    tag = f"GPU{gpu_id}/W{worker_id}"
+    device = "cuda:0"
     spk = session["speaker"]
 
     ckpt = os.path.join(_HERE, checkpoint)
-    print(f"[GPU {gpu_id}] Loading SAM2 model on {device}…", flush=True)
+    print(f"[{tag}] Loading SAM2 model (CUDA_VISIBLE_DEVICES={gpu_id})…", flush=True)
     predictor = build_sam2_video_predictor(model_cfg, ckpt_path=ckpt, device=device)
-    print(f"[GPU {gpu_id}] Model ready.", flush=True)
+    print(f"[{tag}] Model ready.", flush=True)
 
     while True:
         try:
@@ -429,17 +442,17 @@ def _gpu_worker(
             break
 
         video_path = os.path.join(get_video_dir(data_dir, video_subdir, spk), vid_name)
-        print(f"\n[GPU {gpu_id}] → {vid_name}", flush=True)
+        print(f"\n[{tag}] \u2192 {vid_name}", flush=True)
         try:
             with torch.inference_mode():
                 propagate_video(predictor, session, video_path, spk, chunk=chunk,
                                 data_dir=data_dir, frames_temp=frames_temp, subset=subset)
-            done_q.put((gpu_id, vid_name, None))
+            done_q.put((tag, vid_name, None))
         except Exception as e:
             torch.cuda.empty_cache()
-            done_q.put((gpu_id, vid_name, str(e)))
+            done_q.put((tag, vid_name, str(e)))
 
-    print(f"[GPU {gpu_id}] Done.", flush=True)
+    print(f"[{tag}] Done.", flush=True)
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
@@ -462,10 +475,17 @@ def main():
     )
     parser.add_argument(
         "--gpus",
-        default=None,
-        help="Comma-separated GPU indices for multi-GPU mode "
-        "(e.g. 0,1,2,3). Each GPU runs its own model instance "
-        "and pulls videos from a shared queue.",
+        default="0",
+        help="Comma-separated GPU indices (default: '0'). "
+        "One GPU  → --jobs parallel workers share that GPU. "
+        "Multiple → one worker per GPU.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=2,
+        help="Parallel workers per GPU when using a single GPU "
+        "(default: 2). Ignored when multiple GPUs are specified.",
     )
     parser.add_argument(
         "--chunk",
@@ -516,62 +536,45 @@ def main():
 
     print(f"Speaker: {spk}  ({len(video_files)} videos)")
 
-    # ── multi-GPU path ────────────────────────────────────────────────────────
-    if args.gpus:
-        gpu_ids = [int(g.strip()) for g in args.gpus.split(",")]
+    # ── build worker plan ─────────────────────────────────────────────────────
+    gpu_ids = [int(g.strip()) for g in args.gpus.split(",")]
+
+    # (gpu_id, worker_id) pairs
+    if len(gpu_ids) == 1:
+        n_jobs = max(1, args.jobs)
+        worker_plan = [(gpu_ids[0], w) for w in range(n_jobs)]
+        print(f"Single-GPU mode: GPU {gpu_ids[0]}, {n_jobs} parallel worker(s)")
+    else:
+        worker_plan = [(gid, i) for i, gid in enumerate(gpu_ids)]
         print(f"Multi-GPU mode: {gpu_ids}")
 
-        work_q = multiprocessing.Queue()
-        done_q = multiprocessing.Queue()
+    work_q = multiprocessing.Queue()
+    done_q = multiprocessing.Queue()
 
-        for vid_name in video_files:
-            work_q.put(vid_name)
+    for vid_name in video_files:
+        work_q.put(vid_name)
 
-        workers = []
-        for gpu_id in gpu_ids:
-            p = multiprocessing.Process(
-                target=_gpu_worker,
-                args=(gpu_id, session, args.chunk, work_q, done_q,
-                      DATA_DIR, VIDEO_SUBDIR, FRAMES_TEMP, CHECKPOINT, MODEL_CFG,
-                      args.subset),
-                daemon=True,
-            )
-            p.start()
-            workers.append(p)
+    workers = []
+    for gpu_id, wid in worker_plan:
+        p = multiprocessing.Process(
+            target=_gpu_worker,
+            args=(gpu_id, wid, session, args.chunk, work_q, done_q,
+                  DATA_DIR, VIDEO_SUBDIR, FRAMES_TEMP, CHECKPOINT, MODEL_CFG,
+                  args.subset),
+            daemon=True,
+        )
+        p.start()
+        workers.append(p)
 
-        for _ in video_files:
-            gpu_id, vid_name, err = done_q.get()
-            if err:
-                print(f"  [GPU {gpu_id}] ERROR on {vid_name}: {err}")
-            else:
-                print(f"  [GPU {gpu_id}] Finished {vid_name}")
+    for _ in video_files:
+        tag, vid_name, err = done_q.get()
+        if err:
+            print(f"  [{tag}] ERROR on {vid_name}: {err}")
+        else:
+            print(f"  [{tag}] Finished {vid_name}")
 
-        for p in workers:
-            p.join()
-
-    # ── single-GPU path ───────────────────────────────────────────────────────
-    else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        ckpt = os.path.join(_HERE, CHECKPOINT)
-        print(f"Loading SAM2 model on {device}…")
-        predictor = build_sam2_video_predictor(MODEL_CFG, ckpt_path=ckpt, device=device)
-        print("Model loaded.")
-
-        for vid_name in tqdm(video_files):
-            #if not "picture_description2" in vid_name:
-            #    continue
-            video_path = os.path.join(get_video_dir(DATA_DIR, VIDEO_SUBDIR, spk), vid_name)
-            print(f"\n[{vid_name}]")
-            try:
-                with torch.inference_mode():
-                    propagate_video(predictor, session, video_path, spk, chunk=args.chunk,
-                                    data_dir=DATA_DIR, frames_temp=FRAMES_TEMP, subset=args.subset)
-            except Exception as e:
-                print(f"  ERROR: {e}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
+    for p in workers:
+        p.join()
 
     print("\nAll done.")
 
