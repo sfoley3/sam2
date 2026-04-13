@@ -69,7 +69,7 @@ def get_frames_dir(frames_temp: str, spk: str, video_basename: str) -> str:
 
 
 def get_mask_path(data_dir: str, spk: str, video_basename: str) -> str:
-    return os.path.join(data_dir, spk, "sam_seg", "masks", f"{spk}_{video_basename}.npz")
+    return os.path.join(data_dir, spk, "sam_seg", "masks", f"{video_basename}.npz")
 
 
 def get_overlay_path(data_dir: str, spk: str, video_basename: str) -> str:
