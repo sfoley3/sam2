@@ -1,6 +1,6 @@
 {
-  "data_dir": "/data1/span_data/gloss",
-  "video_subdir": "video",
+  "data_dir": "/data1/span_data/rtmri75s",
+  "video_subdir": "2drt/video",
   "frames_temp_dir": "/tmp/sam2_frames",
   "checkpoint": "checkpoints/sam2.1_hiera_large.pt",
   "model_cfg": "configs/sam2.1/sam2.1_hiera_l.yaml"

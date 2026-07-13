@@ -80,7 +80,9 @@ def get_overlay_path(data_dir: str, spk: str, video_basename: str) -> str:
 
 
 def extract_frames(
-    video_path: str, frames_dir: str, init_frame_path: str = None,
+    video_path: str,
+    frames_dir: str,
+    init_frame_path: str = None,
     standard_size: int = None,
 ) -> int:
     """Extract all frames to frames_dir as %05d.jpg using cv2 (matches notebook).
@@ -100,10 +102,16 @@ def extract_frames(
     if init_frame_path and os.path.exists(init_frame_path):
         init_img = cv2.imread(init_frame_path)
         if standard_size:
-            init_img = cv2.resize(init_img, (standard_size, standard_size),
-                                  interpolation=cv2.INTER_LANCZOS4)
-        cv2.imwrite(os.path.join(frames_dir, "00000.jpg"), init_img,
-                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+            init_img = cv2.resize(
+                init_img,
+                (standard_size, standard_size),
+                interpolation=cv2.INTER_LANCZOS4,
+            )
+        cv2.imwrite(
+            os.path.join(frames_dir, "00000.jpg"),
+            init_img,
+            [cv2.IMWRITE_JPEG_QUALITY, 95],
+        )
         offset = 1
 
     cap = cv2.VideoCapture(video_path)
@@ -115,8 +123,9 @@ def extract_frames(
         if not ret:
             break
         if standard_size:
-            frame = cv2.resize(frame, (standard_size, standard_size),
-                               interpolation=cv2.INTER_LANCZOS4)
+            frame = cv2.resize(
+                frame, (standard_size, standard_size), interpolation=cv2.INTER_LANCZOS4
+            )
         cv2.imwrite(
             os.path.join(frames_dir, f"{idx:05d}.jpg"),
             frame,
@@ -134,11 +143,21 @@ def _get_fps(video_path: str) -> float:
     """Get FPS via ffprobe — more reliable than cv2 for AVI files."""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=r_frame_rate",
-             "-of", "default=noprint_wrappers=1:nokey=1",
-             video_path],
-            capture_output=True, text=True, check=True,
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=r_frame_rate",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
         )
         num, den = result.stdout.strip().split("/")
         return float(num) / float(den)
@@ -168,12 +187,15 @@ def write_overlay_video(
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames_in = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"  [FPS] ffprobe → {fps:.3f} fps | source: {total_frames_in} frames "
-          f"= {total_frames_in / fps:.1f}s")
+    print(
+        f"  [FPS] ffprobe → {fps:.3f} fps | source: {total_frames_in} frames "
+        f"= {total_frames_in / fps:.1f}s"
+    )
 
     n_mask_frames = (
         max(m.shape[0] for m in masks_per_region.values())
-        if masks_per_region else total_frames_in
+        if masks_per_region
+        else total_frames_in
     )
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -182,15 +204,26 @@ def write_overlay_video(
     # metadata issues that cause incorrect fps at high frame rates (e.g. 99 fps).
     ffmpeg_proc = subprocess.Popen(
         [
-            "ffmpeg", "-y",
-            "-f", "rawvideo", "-vcodec", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-s", f"{w}x{h}",
-            "-r", str(fps),
-            "-i", "pipe:0",
-            "-vcodec", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-crf", "23",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            str(fps),
+            "-i",
+            "pipe:0",
+            "-vcodec",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "23",
             output_path,
         ],
         stdin=subprocess.PIPE,
@@ -208,8 +241,9 @@ def write_overlay_video(
                 continue
             mask = masks[frame_idx]  # (H, W) bool
             if mask.shape != (h, w):
-                mask = cv2.resize(mask.astype(np.uint8), (w, h),
-                                  interpolation=cv2.INTER_NEAREST).astype(bool)
+                mask = cv2.resize(
+                    mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+                ).astype(bool)
             bgr = _hex_to_bgr(colors[name])
             overlay[mask] = (
                 (1 - alpha) * frame[mask].astype(np.float32)
@@ -223,22 +257,32 @@ def write_overlay_video(
     stderr_bytes = ffmpeg_proc.stderr.read()
     ffmpeg_proc.wait()
     if ffmpeg_proc.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg failed:\n{stderr_bytes.decode()}"
-        )
-    print(f"  [FPS] wrote {frame_idx} frames → {frame_idx / fps:.1f}s at {fps:.3f} fps (intended)")
+        raise RuntimeError(f"ffmpeg failed:\n{stderr_bytes.decode()}")
+    print(
+        f"  [FPS] wrote {frame_idx} frames → {frame_idx / fps:.1f}s at {fps:.3f} fps (intended)"
+    )
 
     # Probe the output file to confirm actual stored fps and duration
     _probe = subprocess.run(
         [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate,nb_frames,duration",
-            "-of", "default=noprint_wrappers=1",
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate,nb_frames,duration",
+            "-of",
+            "default=noprint_wrappers=1",
             output_path,
         ],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
-    print(f"  [FPS] output file probe:\n    " + _probe.stdout.strip().replace("\n", "\n    "))
+    print(
+        "  [FPS] output file probe:\n    "
+        + _probe.stdout.strip().replace("\n", "\n    ")
+    )
 
 
 # ── Propagation core ───────────────────────────────────────────────────────────
@@ -270,8 +314,9 @@ def propagate_video(
     # ── extract frames, prepending the saved init frame as frame 0 ──────────
     frames_dir = get_frames_dir(frames_temp, spk, video_basename)
     print(f"  Extracting frames → {frames_dir}")
-    frame_offset = extract_frames(video_path, frames_dir, init_frame_path,
-                                  standard_size=standard_size)
+    frame_offset = extract_frames(
+        video_path, frames_dir, init_frame_path, standard_size=standard_size
+    )
     if frame_offset:
         print("  Prepended init frame as 00000.jpg (anchor)")
     if standard_size:
@@ -292,9 +337,11 @@ def propagate_video(
         print(f"  [SUBSET] Limiting to first {n_video_frames} video frames")
 
     _src_fps = _get_fps(video_path)
-    print(f"  Source FPS (ffprobe): {_src_fps:.3f} | "
-          f"video frames: {n_video_frames} | "
-          f"duration: {n_video_frames / _src_fps:.1f}s")
+    print(
+        f"  Source FPS (ffprobe): {_src_fps:.3f} | "
+        f"video frames: {n_video_frames} | "
+        f"duration: {n_video_frames / _src_fps:.1f}s"
+    )
 
     # ── init SAM2 inference state ────────────────────────────────────────────
     print(f"  Initialising SAM2 state ({n_total_frames} frames, anchor at frame 0)…")
@@ -366,8 +413,10 @@ def propagate_video(
         filled = [m for m in frames_list if m.any()]
         if filled:
             coverage = np.mean([m.mean() for m in filled])
-            print(f"  {name}: {len(filled)}/{n_video_frames} frames with mask, "
-                  f"mean coverage {coverage:.3%}")
+            print(
+                f"  {name}: {len(filled)}/{n_video_frames} frames with mask, "
+                f"mean coverage {coverage:.3%}"
+            )
         else:
             print(f"  {name}: no mask found in any frame")
 
@@ -445,8 +494,16 @@ def _gpu_worker(
         print(f"\n[{tag}] \u2192 {vid_name}", flush=True)
         try:
             with torch.inference_mode():
-                propagate_video(predictor, session, video_path, spk, chunk=chunk,
-                                data_dir=data_dir, frames_temp=frames_temp, subset=subset)
+                propagate_video(
+                    predictor,
+                    session,
+                    video_path,
+                    spk,
+                    chunk=chunk,
+                    data_dir=data_dir,
+                    frames_temp=frames_temp,
+                    subset=subset,
+                )
             done_q.put((tag, vid_name, None))
         except Exception as e:
             torch.cuda.empty_cache()
@@ -475,7 +532,7 @@ def main():
     )
     parser.add_argument(
         "--gpus",
-        default="0",
+        default="2",
         help="Comma-separated GPU indices (default: '0'). "
         "One GPU  → --jobs parallel workers share that GPU. "
         "Multiple → one worker per GPU.",
@@ -508,7 +565,9 @@ def main():
     )
     args = parser.parse_args()
 
-    CONFIG_PATH = os.path.join('./prompting_configs', f"sam2_{args.dataset}_config.json")
+    CONFIG_PATH = os.path.join(
+        "./prompting_configs", f"sam2_{args.dataset}_config.json"
+    )
 
     _cfg = _load_config(CONFIG_PATH)
 
@@ -520,7 +579,9 @@ def main():
 
     # ── load session ─────────────────────────────────────────────────────────
     spk = args.spk
-    session_path = os.path.join(DATA_DIR, spk, "sam_seg", "sessions", f"session{args.session}.json")
+    session_path = os.path.join(
+        DATA_DIR, spk, "sam_seg", "sessions", f"session{args.session}.json"
+    )
     print(f"Looking for session JSON at {session_path}…")
     if not os.path.exists(session_path):
         print(f"No session found for {spk} at {session_path}")
@@ -531,8 +592,20 @@ def main():
     spk = session["speaker"]
     video_files = get_video_files(DATA_DIR, VIDEO_SUBDIR, spk)
     if not video_files:
-        print(f"No .avi files found for speaker {spk} in {get_video_dir(DATA_DIR, VIDEO_SUBDIR, spk)}")
+        print(
+            f"No .avi files found for speaker {spk} in {get_video_dir(DATA_DIR, VIDEO_SUBDIR, spk)}"
+        )
         sys.exit(1)
+
+    missing_path = os.path.join(DATA_DIR, "missing_regions.txt")
+    with open(missing_path) as mf:
+        missing_stems = {line.split(":", 1)[0].strip() for line in mf if line.strip()}
+    video_files = [
+        f
+        for f in video_files
+        if os.path.splitext(f)[0] in missing_stems
+        or f"{spk}_{os.path.splitext(f)[0]}" in missing_stems
+    ]
 
     print(f"Speaker: {spk}  ({len(video_files)} videos)")
 
@@ -558,9 +631,20 @@ def main():
     for gpu_id, wid in worker_plan:
         p = multiprocessing.Process(
             target=_gpu_worker,
-            args=(gpu_id, wid, session, args.chunk, work_q, done_q,
-                  DATA_DIR, VIDEO_SUBDIR, FRAMES_TEMP, CHECKPOINT, MODEL_CFG,
-                  args.subset),
+            args=(
+                gpu_id,
+                wid,
+                session,
+                args.chunk,
+                work_q,
+                done_q,
+                DATA_DIR,
+                VIDEO_SUBDIR,
+                FRAMES_TEMP,
+                CHECKPOINT,
+                MODEL_CFG,
+                args.subset,
+            ),
             daemon=True,
         )
         p.start()
