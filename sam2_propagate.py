@@ -12,12 +12,17 @@ Usage:
     # multi-GPU (one worker per GPU)
     python sam2_propagate.py --spk spk15 --dataset lss --gpus 0,1,2,3
 
+    # longitudinal dataset (session nested under speaker, e.g. D1A)
+    python sam2_propagate.py --spk ID01 --dataset longitudinal --data-session D1A --gpus 2
+
 Session JSON is read automatically from {data_dir}/{spk}/sam_seg/session.json
-as configured in sam2_gui_config.json.
+as configured in sam2_gui_config.json. For the longitudinal dataset a
+data-collection session is inserted: {data_dir}/{spk}/{data_session}/sam_seg/...
 
 Outputs per video:
     data_dir/spk/sam_seg/masks/{spk}_{video_basename}.npz   (keys=region names, each bool T×H×W)
     data_dir/spk/sam_seg/overlays/{video_basename}.mp4
+    (with --data-session, outputs are under data_dir/spk/{data_session}/sam_seg/…)
 """
 
 import argparse
@@ -42,6 +47,7 @@ os.environ["TQDM_DISABLE"] = "1"
 # spawn'd child processes don't initialise CUDA on all GPUs during module import.
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+SUB_SPK = ["spk15", "spk16", "spk17"]
 
 # ── Path helpers ───────────────────────────────────────────────────────────────
 
@@ -53,27 +59,61 @@ def _load_config(CONFIG_PATH) -> dict:
     return {}
 
 
-def get_video_dir(data_dir: str, video_subdir: str, spk: str) -> str:
-    return os.path.join(data_dir, spk, *video_subdir.split("/"))
+def _spk_base(data_dir: str, spk: str, session_id: str = None) -> str:
+    """Speaker root, with an optional data-collection session level.
+
+    For the longitudinal dataset paths are nested as
+    {data_dir}/{spk}/{session_id}/... (e.g. .../ID01/D1A/...). For datasets
+    without a session level, pass session_id=None to get {data_dir}/{spk}/...
+    """
+    if session_id:
+        return os.path.join(data_dir, spk, session_id)
+    return os.path.join(data_dir, spk)
 
 
-def get_video_files(data_dir: str, video_subdir: str, spk: str) -> list:
-    vd = get_video_dir(data_dir, video_subdir, spk)
+def get_video_dir(
+    data_dir: str, video_subdir: str, spk: str, session_id: str = None
+) -> str:
+    return os.path.join(_spk_base(data_dir, spk, session_id), *video_subdir.split("/"))
+
+
+def get_video_files(
+    data_dir: str, video_subdir: str, spk: str, session_id: str = None
+) -> list:
+    vd = get_video_dir(data_dir, video_subdir, spk, session_id)
     if not os.path.isdir(vd):
         return []
     return sorted(f for f in os.listdir(vd) if f.lower().endswith(".avi"))
 
 
-def get_frames_dir(frames_temp: str, spk: str, video_basename: str) -> str:
+def get_frames_dir(
+    frames_temp: str, spk: str, video_basename: str, session_id: str = None
+) -> str:
+    if session_id:
+        return os.path.join(frames_temp, spk, session_id, video_basename)
     return os.path.join(frames_temp, spk, video_basename)
 
 
-def get_mask_path(data_dir: str, spk: str, video_basename: str) -> str:
-    return os.path.join(data_dir, spk, "sam_seg", "masks", f"{video_basename}.npz")
+def get_mask_path(
+    data_dir: str, spk: str, video_basename: str, session_id: str = None
+) -> str:
+    return os.path.join(
+        _spk_base(data_dir, spk, session_id),
+        "sam_seg",
+        "masks",
+        f"{video_basename}.npz",
+    )
 
 
-def get_overlay_path(data_dir: str, spk: str, video_basename: str) -> str:
-    return os.path.join(data_dir, spk, "sam_seg", "overlays", f"{video_basename}.mp4")
+def get_overlay_path(
+    data_dir: str, spk: str, video_basename: str, session_id: str = None
+) -> str:
+    return os.path.join(
+        _spk_base(data_dir, spk, session_id),
+        "sam_seg",
+        "overlays",
+        f"{video_basename}.mp4",
+    )
 
 
 # ── Frame extraction ───────────────────────────────────────────────────────────
@@ -297,6 +337,7 @@ def propagate_video(
     data_dir: str,
     frames_temp: str,
     subset: int = None,
+    session_id: str = None,
 ) -> None:
     """Propagate saved prompts through one video and save masks + overlay."""
     regions = session["regions"]
@@ -304,7 +345,9 @@ def propagate_video(
     init_frame_path = session.get("init_frame_path")
     if not init_frame_path:
         # Fallback for sessions saved before init_frame_path was added
-        init_frame_path = os.path.join(data_dir, spk, "sam_seg", f"{spk}_frame.jpg")
+        init_frame_path = os.path.join(
+            _spk_base(data_dir, spk, session_id), "sam_seg", f"{spk}_frame.jpg"
+        )
         if os.path.exists(init_frame_path):
             print(f"  Using derived init frame path: {init_frame_path}")
         else:
@@ -312,7 +355,7 @@ def propagate_video(
     video_basename = os.path.splitext(os.path.basename(video_path))[0]
 
     # ── extract frames, prepending the saved init frame as frame 0 ──────────
-    frames_dir = get_frames_dir(frames_temp, spk, video_basename)
+    frames_dir = get_frames_dir(frames_temp, spk, video_basename, session_id)
     print(f"  Extracting frames → {frames_dir}")
     frame_offset = extract_frames(
         video_path, frames_dir, init_frame_path, standard_size=standard_size
@@ -421,7 +464,7 @@ def propagate_video(
             print(f"  {name}: no mask found in any frame")
 
     # ── save masks as single .npz ─────────────────────────────────────────────
-    mask_path = get_mask_path(data_dir, spk, video_basename)
+    mask_path = get_mask_path(data_dir, spk, video_basename, session_id)
     os.makedirs(os.path.dirname(mask_path), exist_ok=True)
 
     masks_per_region = {}
@@ -436,7 +479,7 @@ def propagate_video(
     print(f"  Saved masks {list(masks_per_region.keys())} → {mask_path}")
 
     # ── write overlay video ──────────────────────────────────────────────────
-    overlay_path = get_overlay_path(data_dir, spk, video_basename)
+    overlay_path = get_overlay_path(data_dir, spk, video_basename, session_id)
     print(f"  Writing overlay video → {overlay_path}")
     write_overlay_video(video_path, masks_per_region, colors_per_region, overlay_path)
 
@@ -467,6 +510,7 @@ def _gpu_worker(
     checkpoint: str,
     model_cfg: str,
     subset: int = None,
+    session_id: str = None,
 ) -> None:
     """Load one model instance on gpu_id, drain work_q, report results to done_q."""
     # Restrict this process to only the assigned GPU — must happen before
@@ -490,7 +534,9 @@ def _gpu_worker(
         except queue.Empty:
             break
 
-        video_path = os.path.join(get_video_dir(data_dir, video_subdir, spk), vid_name)
+        video_path = os.path.join(
+            get_video_dir(data_dir, video_subdir, spk, session_id), vid_name
+        )
         print(f"\n[{tag}] \u2192 {vid_name}", flush=True)
         try:
             with torch.inference_mode():
@@ -503,6 +549,7 @@ def _gpu_worker(
                     data_dir=data_dir,
                     frames_temp=frames_temp,
                     subset=subset,
+                    session_id=session_id,
                 )
             done_q.put((tag, vid_name, None))
         except Exception as e:
@@ -557,6 +604,15 @@ def main():
         help="Which SAM2 session to load (default: 1, corresponding to session1.json). ",
     )
     parser.add_argument(
+        "--data-session",
+        dest="data_session",
+        default=None,
+        metavar="SESSION",
+        help="Data-collection session for the longitudinal dataset (e.g. D1A). "
+        "When set, paths are nested as {data_dir}/{spk}/{session}/... . "
+        "Omit for datasets without a session level.",
+    )
+    parser.add_argument(
         "--subset",
         type=int,
         default=None,
@@ -579,8 +635,12 @@ def main():
 
     # ── load session ─────────────────────────────────────────────────────────
     spk = args.spk
+    session_id = args.data_session
     session_path = os.path.join(
-        DATA_DIR, spk, "sam_seg", "sessions", f"session{args.session}.json"
+        _spk_base(DATA_DIR, spk, session_id),
+        "sam_seg",
+        "sessions",
+        f"session{args.session}.json",
     )
     print(f"Looking for session JSON at {session_path}…")
     if not os.path.exists(session_path):
@@ -590,24 +650,29 @@ def main():
         session = json.load(f)
 
     spk = session["speaker"]
-    video_files = get_video_files(DATA_DIR, VIDEO_SUBDIR, spk)
+    video_files = get_video_files(DATA_DIR, VIDEO_SUBDIR, spk, session_id)
     if not video_files:
         print(
-            f"No .avi files found for speaker {spk} in {get_video_dir(DATA_DIR, VIDEO_SUBDIR, spk)}"
+            f"No .avi files found for speaker {spk} in {get_video_dir(DATA_DIR, VIDEO_SUBDIR, spk, session_id)}"
         )
         sys.exit(1)
 
-    missing_path = os.path.join(DATA_DIR, "missing_regions.txt")
-    with open(missing_path) as mf:
-        missing_stems = {line.split(":", 1)[0].strip() for line in mf if line.strip()}
-    video_files = [
-        f
-        for f in video_files
-        if os.path.splitext(f)[0] in missing_stems
-        or f"{spk}_{os.path.splitext(f)[0]}" in missing_stems
-    ]
+    if spk in SUB_SPK:
+        video_files = [f for f in video_files if "lwr" not in f]
+
+    # missing_path = os.path.join(DATA_DIR, "missing_regions.txt")
+    # with open(missing_path) as mf:
+    #    missing_stems = {line.split(":", 1)[0].strip() for line in mf if line.strip()}
+    # video_files = [
+    #     f
+    #     for f in video_files
+    #     if os.path.splitext(f)[0] in missing_stems
+    #     or f"{spk}_{os.path.splitext(f)[0]}" in missing_stems
+    # ]
 
     print(f"Speaker: {spk}  ({len(video_files)} videos)")
+    if session_id:
+        print(f"Data session: {session_id}")
 
     # ── build worker plan ─────────────────────────────────────────────────────
     gpu_ids = [int(g.strip()) for g in args.gpus.split(",")]
@@ -644,6 +709,7 @@ def main():
                 CHECKPOINT,
                 MODEL_CFG,
                 args.subset,
+                session_id,
             ),
             daemon=True,
         )
